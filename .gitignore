@@ -1,0 +1,21 @@
+# 运行时挂载卷（FastTask files / ES 数据）
+files/
+es_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 本地配置与凭据
+.env
+*.local.yml
+*.local.yaml
+files/fasttask/conf/user_to_passwd.json
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
