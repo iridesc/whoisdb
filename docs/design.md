@@ -432,19 +432,51 @@ python3 scripts/probe_rdap.py example.com google.com
 用户输入域名
   → Web 后端调 FastTask POST /run/query_whois {domain}
   → 任务逻辑：
-      1. ES 查该域名 fetched_at 最大且距今 < 1d 的记录
-      2. 命中 → 直接返回库中记录
-      3. 未命中或已过期 → 实时抓取 WHOIS
-             a. 实时结果与库中最新记录算 content_hash 比对
-             b. 一致 → 仅更新 fetched_at（不新增文档）
-             c. 不一致 → 插入新文档（fetched_at = 当前时间）
+      1. 查新鲜度标记：该域名「上次检查时间」距今 < 1d？
+      2. 是 → 直接返回 whois_records 中该域名最新文档
+      3. 否 → 实时抓取 WHOIS
+             a. 与库中最新记录比对 content_hash
+             b. 一致 → 仅刷新新鲜度标记（不插文档）
+             c. 不一致 → 插入新文档 + 刷新新鲜度标记
       4. 返回最新记录
 ```
 
-> **【待裁决 Q2】** 第 3.b 步「一致时是否更新 `fetched_at`」：文档不新增则新鲜度标记无处安放。
-> 备选：(a) 新增一条 `content_hash` 相同的文档（文档数膨胀）；
-> (b) 维护独立的 `last_fetched_at` 映射/索引；
-> (c) 直接更新原文档的 `fetched_at`（会丢失"内容未变"的审计痕迹）。
+> 步骤 3.b「仅刷新新鲜度标记」依赖 Q2 的裁决（新鲜度标记存哪），详见 §6.2.1。
+
+#### 6.2.1 【待裁决 Q2】内容未变化时，新鲜度记在哪
+
+**问题本质**：`fetched_at` 背负两个语义，内容变化时重合、内容不变时冲突：
+
+| 语义 | 内容变化时 | 内容不变时 |
+|---|---|---|
+| ① 这条内容的抓取时间（文档归属） | 新文档的 `fetched_at` | 应保持原样 |
+| ② 域名的新鲜度标记（上次检查时间） | 同上 | **需要刷新**（否则 1d 缓存失效，每次查询都触发抓取） |
+
+「内容一致则跳过」只是**不插记录**，但「本次检查过了」这个事实必须记下来。
+
+**三个方案**：
+
+| 方案 | 做法 | 优点 | 缺点 |
+|---|---|---|---|
+| **a** 每次检查都插文档（含同 hash） | 内容一致也插一条 `fetched_at` 新、`content_hash` 相同的文档 | 实现最简单；最新文档 `fetched_at` 即新鲜度标记 | 每天全量刷新每天 +N 条冗余文档；变更历史被「未变」噪声淹没 |
+| **b** 独立检查状态（建议） | 内容变了才插 `whois_records`；另维护轻量索引 `whois_check_state`（domain → `last_checked_at`、`last_content_hash`） | 历史纯净=变更记录（监测核心价值）；新鲜度独立管理 | 多一个索引，写入需维护一致性 |
+| **c** 更新原文档 `fetched_at` | 内容一致时 update 最新文档的 `fetched_at` | 单索引 | 语义混淆：`fetched_at` 变成「最后确认时间」，历史失真 |
+
+**倾向方案 b**，理由：监测系统的核心产出是变更历史，方案 a 会把「每日例行检查无变化」的噪声灌进历史；
+方案 c 破坏历史真实性。方案 b 的独立索引很轻（仅 `domain` / `last_checked_at` / `last_content_hash` 三字段）。
+
+方案 b 的查询流程：
+
+```
+查 whois_check_state → last_checked_at < 1d？
+  是 → 直接返回 whois_records 里该域名最新文档
+  否 → 实时抓取 → 比对 last_content_hash
+        内容变 → 插 whois_records + 更新 check_state（时间 + 新 hash）
+        内容未变 → 只更新 check_state.last_checked_at（历史文档不动）
+```
+
+**待定前提**：域名库预期规模（见 Q17），直接决定方案 a 的膨胀是否可接受——
+几万级方案 a 也能凑合，百万级只能方案 b。
 
 ### 6.3 定时刷新流程
 
@@ -489,7 +521,7 @@ python3 scripts/probe_rdap.py example.com google.com
 | 编号 | 问题 | 备选方案 | 建议 |
 |---|---|---|---|
 | **Q1** | 实时抓取走哪条路？ | ~~A 自跑 pypywhois / B 调 whois_lookup / C 实现 RDAP~~ | ✅ **已裁决**：独立抓取模块，后续单独实现，不复用旧 whois_lookup |
-| **Q2** | 内容未变化时如何记录新鲜度？ | a 新增同 hash 文档 / b 独立 last_fetched_at 映射 / c 更新原文档 fetched_at | **b**（配合 a 的取舍需评估） |
+| **Q2** | 内容未变化时如何记录新鲜度？ | a 新增同 hash 文档 / b 独立检查状态索引 / c 更新原文档 fetched_at | 建议 **b**，详见 §6.2.1 |
 | **Q3** | `query_status` 取值集合 | ~~`ok`/`not_found`/`error`，还是再加 `timeout`/`unsupported_tld`~~ | ✅ **已裁决**：`ok` / `not_found` / `error` 三态 |
 | **Q4** | 定时刷新区间 | 仅刷「距上次抓取 ≥ 1 天」/ 强制全量 | 按 `fetched_at` 增量刷 |
 | **Q5** | RDAP 是否作为补充数据源？ | 仅 port43 / port43 + RDAP 补 status & dnssec | 待定（与独立抓取模块方案一并裁决） |
@@ -504,6 +536,7 @@ python3 scripts/probe_rdap.py example.com google.com
 | **Q13** | `raw_whois` 存储位置 | ES 内（index:false）/ 对象存储 / 只保留最近 N 份 | 需明确 |
 | **Q14** | 是否需要"域名 WHOIS 暴露个人敏感信息"风险识别 | 需要 / 不需要 | 建议需要（可复用 easm-scout 的 `domain_whois_expose_personal_info` 枚举） |
 | **Q15** | 服务端口分配 | `whois_lookup` 占用 9018，`icp_lookup` 占用 9013 | 建议 9019，待查全量占用 |
+| **Q17** | 域名库预期规模 | 几万 / 十万 / 百万级 | 影响 Q2（方案 a/b 取舍）与 Q11（历史保留） |
 
 ---
 
