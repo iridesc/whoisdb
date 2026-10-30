@@ -281,59 +281,96 @@ python3 scripts/probe_rdap.py example.com google.com
 
 ## 4. 字段方案
 
-### 4.1 基线字段（沿用上游 13 字段，语义与命名保持一致）
+### 4.0 设计总基调（已裁决）
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `registrant_name` | text (ik_max_word) | 注册人姓名，隐私保护时为「隐私保护」 |
-| `registrant_phone` | text | 注册人电话 |
-| `registrant_email` | text | 注册人邮箱，多个逗号分隔 |
-| `registrant_organization` | text (ik_max_word) | 注册人单位 |
-| `registrant_country` | keyword | 国家/地区代码，大写如 `CN` |
-| `registrant_province` | text | 省份 |
-| `registrant_city` | text | 城市 |
-| `registrant_address` | text | 地址 |
-| `creation_date` | date | 创建时间 |
-| `expiration_date` | date | 过期时间 |
-| `updated_date` | date | 注册局最后更新时间 |
-| `name_servers` | text | 域名服务器，多个逗号分隔 |
-| `registrar` | text (ik_max_word) | 注册商 |
+**平铺为主 + 原始文档兜底**：
 
-### 4.2 扩展字段（监测必需）
+- 需要检索 / diff 的核心字段拍平成平铺字段；天然多值字段用 `keyword[]` 数组，不拍成逗号串
+- 其余信息（admin/tech 联系人、NS 的 IP、RDAP 原始嵌套结构等）**不拍平**，统一由原始文档
+  （`raw_whois`，后续抓取模块若走 RDAP 则另存 `raw_rdap`）兜底，需要时再翻
+- 字段命名对齐 **RDAP / vCard 官方术语**，snake_case，不迁就上游 / EISA 生态旧命名
 
-| 字段 | 类型 | 说明 | 来源 |
+> 依据：RDAP 是嵌套 JSON 文档（见 §2.2），全拍平会丢结构、全保留嵌套会难检索难 diff，
+> 故取「拍平核心 + raw 兜底」。
+
+### 4.1 字段总表（23 个平铺字段）
+
+类型列含义：`kw`=keyword，`kw[]`=keyword 数组，`ik`=text(ik_max_word 分词)，
+`date`=date（ISO8601），`bool`=boolean，`raw`=text(index:false)。
+
+#### 域名与系统元数据
+
+| 字段 | 类型 | 说明 | RDAP 官方路径 |
 |---|---|---|---|
-| `domain` | keyword | 域名（小写），查询主键 | 规范化 |
-| `fetched_at` | date | **本次抓取时间**，判断 1d 新鲜度、排序取最新 | 系统生成 |
-| `query_status` | keyword | `ok` / `not_found` / `error`，区分失败与未注册 | 系统生成 |
-| `is_registered` | boolean | 是否已注册 | 系统生成 |
-| `statuses` | keyword[] | **EPP 状态码数组**（如 `clientTransferProhibited`） | RDAP `status[]` / whois `status` |
-| `dnssec` | keyword | `signed` / `unsigned` | RDAP `secureDNS` / whois `dnssec` |
-| `registrar_iana_id` | keyword | 注册商 IANA ID | RDAP `publicIds` |
-| `registrar_abuse_email` | keyword | 注册商滥用投诉邮箱 | RDAP 嵌套 abuse entity |
-| `registrar_abuse_phone` | keyword | 注册商滥用投诉电话 | RDAP 嵌套 abuse entity |
-| `handle` | keyword | 注册局对象唯一标识 | RDAP `handle` |
-| `admin_contacts` | object[] | RDAP admin 实体 | RDAP `entities` |
-| `tech_contacts` | object[] | RDAP tech 实体 | RDAP `entities` |
-| `name_servers_normalized` | keyword[] | **排序后**的 NS（diff 用，消除顺序噪声） | 规范化 |
-| `content_hash` | keyword | 规范化核心字段的 hash，判断"完全一致则跳过" | 计算 |
-| `raw_whois` | text, index:false | 原始 WHOIS 全文（溯源/排障，不参与检索） | 原始响应 |
+| `domain` | kw | 域名（小写化），查询主键 | `ldhName`（小写化） |
+| `fetched_at` | date | 本次抓取时间，判断 1d 新鲜度、排序取最新 | —（系统生成） |
+| `query_status` | kw | `ok` / `not_found` / `error`，区分失败与未注册 | —（系统生成） |
+| `content_hash` | kw | 规范化核心字段 hash，判断"完全一致则跳过" | —（计算） |
+| `raw_whois` | raw | 原始文档兜底（溯源/排障，不参与检索；体积问题后置） | —（原始响应） |
+
+#### 生命周期（RDAP `events[].eventAction`）
+
+| 字段 | 类型 | 说明 | RDAP 官方路径 |
+|---|---|---|---|
+| `registration_date` | date | 创建时间 | `events[eventAction=registration].eventDate` |
+| `expiration_date` | date | 过期时间 | `events[eventAction=expiration].eventDate` |
+| `last_changed_date` | date | 注册局最后变更时间 | `events[eventAction=last changed].eventDate` |
+
+#### 状态与 DNSSEC
+
+| 字段 | 类型 | 说明 | RDAP 官方路径 |
+|---|---|---|---|
+| `status` | kw[] | EPP 状态码数组（如 `clientTransferProhibited`） | `status[]` |
+| `zone_signed` | bool | 区域是否已签名 | `secureDNS.zoneSigned` |
+| `delegation_signed` | bool | 父区是否有 DS 记录 | `secureDNS.delegationSigned` |
+
+#### 名称服务器与注册商
+
+| 字段 | 类型 | 说明 | RDAP 官方路径 |
+|---|---|---|---|
+| `nameservers` | kw[] | NS 主机名列表（小写化） | `nameservers[].ldhName` |
+| `registrar` | ik | 注册商名称 | `entities[roles=registrar].vcardArray[fn]` |
+| `registrar_iana_id` | kw | 注册商 IANA ID | `entities[roles=registrar].publicIds[type="IANA Registrar ID"].identifier` |
+
+#### 注册人（vCard 属性，`entities[roles=registrant]`）
+
+| 字段 | 类型 | 说明 | vCard 官方属性 |
+|---|---|---|---|
+| `registrant_name` | ik | 注册人姓名，隐私保护时为「隐私保护」 | `fn` |
+| `registrant_organization` | ik | 注册人单位 | `org` |
+| `registrant_phone` | kw | 注册人电话，**存 URI 原值**（`tel:+1-555-555-1234;ext=102`） | `tel` |
+| `registrant_email` | kw | 注册人邮箱 | `email` |
+| `registrant_street` | ik | 街道地址 | `adr[2]` street address |
+| `registrant_locality` | ik | 城市 | `adr[3]` locality |
+| `registrant_region` | ik | 州/省 | `adr[4]` region |
+| `registrant_postal_code` | kw | 邮编 | `adr[5]` postal code |
+| `registrant_country` | kw | 国家/地区（ISO 3166-1 alpha-2 代码，如 `CN`） | `adr[6]` country name |
+
+> `adr[0]`（post office box）与 `adr[1]`（extended address）不拍平，由 raw 兜底。
+
+### 4.2 字段命名与值域约定（已裁决）
+
+- **命名风格**：snake_case；语义取 RDAP / vCard 官方术语（`fn`→name、`org`→organization、`tel`→phone）。
+- **日期**：统一 ISO8601 带时区（如 `2027-08-13T04:00:00Z`）；ES `date` 类型。
+- **域名与 NS**：入库前统一小写化（RDAP 实测 `ldhName` 返回大写）。
+- **status**：沿用 RDAP 风格（小写空格分隔，如 `client transfer prohibited`）；
+  若抓取源为 port 43 的 camelCase（`clientTransferProhibited`），由抓取模块归一化为 RDAP 风格后再入库。
+- **`registrant_country` 值域**：存 ISO 3166-1 alpha-2 代码（如 `CN`）。
+  注：RDAP 官方 `adr[6]` 语义为 country name（全名），但注册局实际返回不统一（全名/代码都有），
+  抓取模块需统一归一化为 alpha-2 代码后再入库。
 
 ### 4.3 `content_hash` 参与字段
 
-**参与**（语义字段）：`registrant_*`（8 项）、`creation_date`、`expiration_date`、
-`updated_date`、`name_servers_normalized`、`registrar`、`registrar_iana_id`、
-`statuses`、`dnssec`
+**参与**（语义字段）：`registration_date`、`expiration_date`、`last_changed_date`、
+`status`、`zone_signed`、`delegation_signed`、`nameservers`、`registrar`、
+`registrar_iana_id`、`registrant_name`、`registrant_organization`、`registrant_phone`、
+`registrant_email`、`registrant_street`、`registrant_locality`、`registrant_region`、
+`registrant_postal_code`、`registrant_country`
 
-**不参与**（易变噪声）：`fetched_at`、`raw_whois`、`query_status`、
-`registrar_abuse_email` / `registrar_abuse_phone`
+**不参与**（易变噪声）：`domain`（主键不变）、`fetched_at`、`query_status`、
+`content_hash`、`raw_whois`
 
-规范化规则：所有值 trim + 小写；多值字段排序后拼接；`None` 与 `""` 等价。
-
-> `registrar_abuse_*` 不参与的理由：滥用联系方式在不同注册局间经常变化，但不代表域名注册状态变化。
-> **【待裁决 Q6】** 若希望捕获这类变更，可将其纳入 hash。
-
----
+规范化规则：所有值 trim + 小写；多值字段（`status`、`nameservers`）排序后拼接；`None` 与 `""` 等价。
 
 ## 5. 存储设计
 
@@ -349,18 +386,22 @@ python3 scripts/probe_rdap.py example.com google.com
 
 ### 5.2 IK 分词配置
 
-| 字段 | 索引 analyzer | 查询 analyzer | 说明 |
-|---|---|---|---|
-| `registrant_name` | `ik_max_word` | `ik_smart` | 中文姓名，索引细粒度 / 查询粗粒度 |
-| `registrant_organization` | `ik_max_word` | `ik_smart` | 中文机构名 |
-| `registrar` | `ik_max_word` | `ik_smart` | 注册商名（中英文混合） |
-| `domain` | `english_analyzer` | `english_analyzer` | 域名，标准分词 + `.keyword` 精确子字段 |
-| `name_servers` | `english_analyzer` | `english_analyzer` | 同上 |
-| `registrant_address` / `_city` / `_province` | `ik_max_word` | `ik_smart` | 中文地址 |
-| `raw_whois` | `standard` | — | `index: false`，不参与检索 |
+需要 IK 中文分词的字段（索引 `ik_max_word` 细粒度 / 查询 `ik_smart` 粗粒度）：
 
-沿用 `icp_lookup/tasks/packages/es.py` 的 analyzer 定义（`ik_smart_analyzer` /
-`ik_max_word_analyzer` / `english_analyzer` / `fuzzy_domain_analyzer` / `domain_semantic_analyzer`），
+| 字段 | 说明 |
+|---|---|
+| `registrar` | 注册商名（中英文混合） |
+| `registrant_name` | 中文姓名 |
+| `registrant_organization` | 中文机构名 |
+| `registrant_street` | 中文街道地址 |
+| `registrant_locality` | 城市 |
+| `registrant_region` | 州/省 |
+
+其余 `kw` / `kw[]` 字段（`domain`、`status`、`nameservers`、`registrar_iana_id`、
+`registrant_phone` / `registrant_email` / `registrant_postal_code` / `registrant_country`）
+用 keyword 精确匹配；域名片段模糊检索见检索设计（待补）。
+
+沿用 `icp_lookup/tasks/packages/es.py` 的 analyzer 定义（`ik_smart_analyzer` / `ik_max_word_analyzer`），
 需 ES 镜像带 IK 插件。
 
 ### 5.3 与 `icp_lookup` 的差异对照
@@ -418,16 +459,15 @@ python3 scripts/probe_rdap.py example.com google.com
 
 ### 6.4 实时抓取的数据源
 
-**【待裁决 Q1】** 三选一：
+**【已裁决 Q1】** 抓取走**独立模块**：
 
-| 方案 | 说明 | 优缺点 |
-|---|---|---|
-| **A（推荐）** | 本项目自跑 pypywhois，把 `whois_kit.py` 移植到 `tasks/packages/`，去掉 24h 缓存改为自控 TTL | 完全自控抓取时机；与上游代码同源；需镜像装 `whois` 命令 |
-| B | 调用 `whois_lookup` HTTP API，并为其增加 `force_refresh` 参数绕过缓存 | 复用现有服务；需改动上游项目；跨服务依赖 |
-| C | 本项目实现 RDAP 抓取为主源 | RDAP 结构化、status/DNSSEC 精确；但 registrant 字段缺失（T3），实现成本高 |
+- 不复用旧 `whois_lookup`（既不调用其 HTTP API，也不移植其 `whois_kit.py`）
+- 该独立抓取模块**后续单独设计、单独实现**，本次设计文档不展开其内部细节
+- 对当前设计的影响：字段方案与存储设计不绑定任何具体抓取实现，抓取模块只需能产出符合 §4 字段契约的数据
 
-> 上游 `whois_lookup` 的 `query_whois` 上挂了 `@lazy_action(expire=86400)`，按域名缓存成功结果 24h。
-> 若走方案 B 且不绕过缓存，每日刷新任务拿到的可能是前一天的数据，监测失效。
+> 背景：旧 `whois_lookup` 的 `query_whois` 挂了 `@lazy_action(expire=86400)` 按域名缓存成功结果 24h，
+> 且其 13 字段缺失 `status` / `zone_signed` / `delegation_signed` / `registrar_iana_id` 等监测关键字段，不适合直接作为监测数据源。
+> 独立模块的抓取协议选型（port 43 为主 / RDAP 补充 / 两者结合）见 Q5，与模块实现方案一并后续裁决。
 
 ---
 
@@ -448,14 +488,15 @@ python3 scripts/probe_rdap.py example.com google.com
 
 | 编号 | 问题 | 备选方案 | 建议 |
 |---|---|---|---|
-| **Q1** | 实时抓取走哪条路？ | A 自跑 pypywhois / B 调 whois_lookup 加 force_refresh / C 实现 RDAP | **A** |
+| **Q1** | 实时抓取走哪条路？ | ~~A 自跑 pypywhois / B 调 whois_lookup / C 实现 RDAP~~ | ✅ **已裁决**：独立抓取模块，后续单独实现，不复用旧 whois_lookup |
 | **Q2** | 内容未变化时如何记录新鲜度？ | a 新增同 hash 文档 / b 独立 last_fetched_at 映射 / c 更新原文档 fetched_at | **b**（配合 a 的取舍需评估） |
-| **Q3** | `query_status` 取值集合 | `ok`/`not_found`/`error`，还是再加 `timeout`/`unsupported_tld` | `ok`/`not_found`/`error` 三态 |
+| **Q3** | `query_status` 取值集合 | ~~`ok`/`not_found`/`error`，还是再加 `timeout`/`unsupported_tld`~~ | ✅ **已裁决**：`ok` / `not_found` / `error` 三态 |
 | **Q4** | 定时刷新区间 | 仅刷「距上次抓取 ≥ 1 天」/ 强制全量 | 按 `fetched_at` 增量刷 |
-| **Q5** | RDAP 是否作为补充数据源？ | 仅 port43 / port43 + RDAP 补 status & dnssec | **补充 RDAP**（补 `statuses`/`dnssec`） |
-| **Q6** | `registrar_abuse_*` 是否纳入 content_hash？ | 纳入 / 不纳入 | 不纳入 |
-| **Q7** | 三个日期字段是否升级为 ISO 8601 带时区？ | 保持 `YYYY-MM-DD` / 升级为 `2027-08-13T04:00:00Z` | **升级**（到期倒计时需要） |
+| **Q5** | RDAP 是否作为补充数据源？ | 仅 port43 / port43 + RDAP 补 status & dnssec | 待定（与独立抓取模块方案一并裁决） |
+| **Q6** | ~~`registrar_abuse_*` 是否纳入 content_hash？~~ | — | ✅ **已废弃**：该字段已砍（raw 兜底） |
+| **Q7** | 三个日期字段是否升级为 ISO 8601 带时区？ | ~~保持 `YYYY-MM-DD` / 升级~~ | ✅ **已裁决**：升级 ISO8601 带时区 |
 | **Q8** | 域名来源与入库方式 | 谁往库里加域名？手工/API/CSV 导入/爬虫发现 | 需明确 |
+| **Q16** | `registrant_country` 值域 | ~~ISO 3166-1 alpha-2 代码 / 国家全名~~ | ✅ **已裁决**：ISO 3166-1 alpha-2 代码 |
 | **Q9** | Web 前端形态 | 独立前端 / FastAPI 自带页面 / 复用 easm-scout 前端 | 需明确 |
 | **Q10** | 查询接口用 `run` 还是 `create`+`check`？ | `run` 同步（简单）/ `create`+`check` 异步（不占连接） | 实时抓取耗时长，倾向异步；但用户明确说「调用 fasttask 的 run 接口」→ **run** |
 | **Q11** | 历史记录保留策略 | 永久保留 / 保留 N 天 / 只留最近 K 条 | 需明确 |
@@ -474,7 +515,7 @@ python3 scripts/probe_rdap.py example.com google.com
 | R2 | RDAP `ldhName` 大写（T2） | 入库前统一 `lowercase()` |
 | R3 | 未注册域名被误判为已注册（上游坑 1） | 严格禁止把 pypywhois 的 `name`/`tld` 当注册人信息 |
 | R4 | 查询失败被误判为未注册（上游坑 6） | 引入 `query_status` 区分 |
-| R5 | 多值字段顺序不同导致假变更 | `name_servers_normalized` 排序后再参与 hash |
+| R5 | 多值字段顺序不同导致假变更 | `status` / `nameservers` 数组在计算 content_hash 前排序 |
 | R6 | WHOIS 服务器限流 / 超时 | 沿用上游策略：单域名超时 30s、失败重试 3 次、失败不写缓存 |
 | R7 | ES 数据量膨胀（每日全量刷新 + 变化即写） | 依赖 content_hash 去重；配合 Q11 保留策略 |
 | R8 | whois_kit.py 移植后与上游分叉 | 保留上游文件头注释标注来源与差异 |
